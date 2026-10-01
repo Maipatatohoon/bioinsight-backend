@@ -70,3 +70,34 @@ def run_deseq2(request: AnalysisRequest):
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"DESeq2 analysis failed: {str(e)}")
 
+@app.post("/api/analyze/edger")
+def run_edger(request: AnalysisRequest):
+    try:
+        counts_df = pd.DataFrame(request.counts)
+        meta_df = pd.DataFrame(request.metadata)
+        
+        script_path = os.path.join(os.path.dirname(__file__), "edger", "edger_script.R")
+        
+        result_df = REngineRunner.run_r_script(script_path, counts_df, meta_df, request.params)
+        result_df = result_df.where(pd.notnull(result_df), None)
+        
+        return {"status": "success", "results": result_df.to_dict(orient="index")}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"edgeR analysis failed: {str(e)}")
+
+@app.post("/api/analyze/limma")
+def run_limma(request: AnalysisRequest):
+    try:
+        counts_df = pd.DataFrame(request.counts)
+        meta_df = pd.DataFrame(request.metadata)
+        
+        script_path = os.path.join(os.path.dirname(__file__), "limma", "limma_script.R")
+        
+        result_df = REngineRunner.run_r_script(script_path, counts_df, meta_df, request.params)
+        result_df = result_df.where(pd.notnull(result_df), None)
+        
+        return {"status": "success", "results": result_df.to_dict(orient="index")}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"limma-voom analysis failed: {str(e)}")
+
+
