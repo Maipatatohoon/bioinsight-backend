@@ -9,82 +9,73 @@ suppressPackageStartupMessages({
   library(argparse)
 })
 
-# 1. Setup Argument Parser
-parser <- ArgumentParser(description="Run limma-voom analysis on count data.")
-parser$add_argument("--counts", type="character", required=TRUE, help="Path to input counts CSV")
-parser$add_argument("--metadata", type="character", required=TRUE, help="Path to input metadata CSV")
-parser$add_argument("--formula", type="character", required=TRUE, help="Design formula (e.g., ~ condition)")
-parser$add_argument("--contrast", type="character", required=TRUE, help="Contrast string (e.g., condition_Treated_vs_Control)")
-parser$add_argument("--output", type="character", required=TRUE, help="Path to save output results CSV")
+# 1. Parse Arguments
+parser <- ArgumentParser(description="Run limma-voom differential expression analysis.")
+parser$add_argument("--counts", type="character", required=TRUE, help="Path to raw count matrix CSV")
+parser$add_argument("--meta", type="character", required=TRUE, help="Path to metadata CSV")
+parser$add_argument("--out", type="character", required=TRUE, help="Path to save output results CSV")
+parser$add_argument("--design", type="character", default="~ condition", help="Design formula")
+parser$add_argument("--contrast", type="character", default="", help="Contrast string")
+
 args <- parser$parse_args()
 
-# 2. Load Data
-counts <- read.csv(args$counts, row.names=1, check.names=FALSE)
-metadata <- read.csv(args$metadata, row.names=1, check.names=FALSE)
+# 2. Load Input Files
+cts <- read.csv(args$counts, row.names=1, check.names=FALSE)
+coldata <- read.csv(args$meta, row.names=1, check.names=FALSE)
 
-# Ensure sample names match
-common_samples <- intersect(colnames(counts), rownames(metadata))
-counts <- counts[, common_samples, drop=FALSE]
-metadata <- metadata[common_samples, , drop=FALSE]
+common_samples <- intersect(colnames(cts), rownames(coldata))
+if (length(common_samples) < 2) {
+  stop("Fewer than 2 overlapping samples between count matrix and metadata.")
+}
+cts <- cts[, common_samples, drop=FALSE]
+coldata <- coldata[common_samples, , drop=FALSE]
 
-# 3. Parse Formula and Contrast
-form <- as.formula(args$formula)
-contrast_parts <- unlist(strsplit(args$contrast, "_"))
-if (length(contrast_parts) != 4 || contrast_parts[3] != "vs") {
-    stop(paste("Invalid contrast format:", args$contrast, ". Expected format: Factor_LevelA_vs_LevelB"))
+for (col in colnames(coldata)) {
+  coldata[[col]] <- as.factor(coldata[[col]])
 }
 
-factor_name <- contrast_parts[1]
-level_numerator <- contrast_parts[2]
-level_denominator <- contrast_parts[4]
-
-if (!factor_name %in% colnames(metadata)) {
-    stop(paste("Factor", factor_name, "not found in metadata columns."))
-}
-
-metadata[[factor_name]] <- factor(metadata[[factor_name]])
-
-# 4. Filter and Normalize using DGEList + TMM
-dge <- DGEList(counts=counts)
+# 3. Create DGEList, Filter & Normalize
+dge <- DGEList(counts=as.matrix(cts), samples=coldata)
 keep <- filterByExpr(dge)
 dge <- dge[keep, , keep.lib.sizes=FALSE]
-dge <- calcNormFactors(dge)
+dge <- calcNormFactors(dge, method="TMM")
 
-# 5. Design Matrix
-design <- model.matrix(form, data=metadata)
+# 4. Apply Voom Transformation & Fit Linear Model
+design_formula <- as.formula(args$design)
+design_mat <- model.matrix(design_formula, data=coldata)
 
-# 6. Apply Voom Transformation
-v <- voom(dge, design, plot=FALSE)
+v <- voom(dge, design_mat, plot=FALSE)
+fit <- lmFit(v, design_mat)
 
-# 7. Fit Linear Model
-fit <- lmFit(v, design)
-
-# 8. Setup Contrast Matrix & eBayes
-coef_name <- paste0(factor_name, level_numerator)
-if (!coef_name %in% colnames(design)) {
-    design <- model.matrix(~ 0 + metadata[[factor_name]])
-    colnames(design) <- levels(metadata[[factor_name]])
-    v <- voom(dge, design, plot=FALSE)
-    fit <- lmFit(v, design)
-    
-    contrast_matrix <- makeContrasts(
-        contrasts = paste(level_numerator, "-", level_denominator),
-        levels = design
-    )
-    fit2 <- contrasts.fit(fit, contrast_matrix)
-    fit2 <- eBayes(fit2)
-} else {
-    fit2 <- eBayes(fit)
+# 5. Contrast Testing & Empirical Bayes Moderation
+coef_idx <- 2
+if (nchar(args$contrast) > 0) {
+  parts <- unlist(strsplit(args$contrast, "_vs_"))
+  if (length(parts) == 2) {
+    sub_parts <- unlist(strsplit(parts[1], "_"))
+    factor_name <- sub_parts[1]
+    num_level <- paste(sub_parts[-1], collapse="_")
+    coef_name <- paste0(factor_name, num_level)
+    if (coef_name %in% colnames(design_mat)) {
+      coef_idx <- coef_name
+    }
+  }
 }
 
-# 9. Format Results
-res <- topTable(fit2, number=Inf, coef=if (coef_name %in% colnames(design)) coef_name else 1)
-res$Gene <- rownames(res)
-res <- res[, c("Gene", "logFC", "AveExpr", "t", "P.Value", "adj.P.Val")]
+fit2 <- eBayes(fit)
+res_table <- topTable(fit2, number=Inf, coef=coef_idx)
+res_table$Gene <- rownames(res_table)
 
-# Rename columns for unified backend schema (DESeq2 standard keys)
-colnames(res) <- c("Gene", "log2FoldChange", "baseMean", "stat", "pvalue", "padj")
+# Map limma columns to standard BioInsight 360 backend schema
+res_df <- data.frame(
+  Gene = res_table$Gene,
+  log2FoldChange = res_table$logFC,
+  baseMean = 2^(res_table$AveExpr),
+  stat = res_table$t,
+  pvalue = res_table$P.Value,
+  padj = res_table$adj.P.Val,
+  stringsAsFactors = FALSE
+)
 
-# 10. Save Output
-write.csv(res, args$output, row.names=FALSE, quote=FALSE)
-cat("limma-voom analysis completed successfully.\n")
+write.csv(res_df, file=args$out, row.names=FALSE)
+cat("limma-voom execution completed successfully.\n")
