@@ -2,6 +2,8 @@
 import unittest
 import sys
 import os
+import shutil
+import tempfile
 import pandas as pd
 import numpy as np
 
@@ -14,6 +16,9 @@ from app.analysis.profiler import profile_dataset
 class TestBioInsightBackend(unittest.TestCase):
 
     def setUp(self):
+        self._tmp = tempfile.mkdtemp(prefix="bioinsight_be_")
+        os.environ["BIOINSIGHT_DB_PATH"] = os.path.join(self._tmp, "jobs.db")
+        JobStore._instance = None
         np.random.seed(42)
         genes = [f"Gene_{i}" for i in range(1, 21)]
         samples = ["Control_1", "Control_2", "Treated_1", "Treated_2"]
@@ -23,6 +28,11 @@ class TestBioInsightBackend(unittest.TestCase):
             "condition": ["Control", "Control", "Treated", "Treated"],
             "organism": ["Homo sapiens"] * 4
         }, index=samples)
+
+    def tearDown(self):
+        JobStore._instance = None
+        os.environ.pop("BIOINSIGHT_DB_PATH", None)
+        shutil.rmtree(self._tmp, ignore_errors=True)
 
     def test_valid_input_validation(self):
         clean_counts, clean_meta, warnings = validate_analysis_input(self.counts_df, self.meta_df, {"condition_col": "condition"})
@@ -43,10 +53,10 @@ class TestBioInsightBackend(unittest.TestCase):
 
     def test_job_store_creation(self):
         store = JobStore()
-        job_id = store.create_job({"Gene_1": {"Sample_1": 10}}, {"Sample_1": {"condition": "Control"}}, {})
+        job_id = store.create_job("/tmp/c.csv", "/tmp/m.csv", {})
         self.assertIsNotNone(job_id)
         job = store.get_job(job_id)
-        self.assertEqual(job["state"], JobState.QUEUED)
+        self.assertEqual(job["state"], JobState.VALIDATING)
         
         store.update_job(job_id, JobState.COMPLETED, 100, "Finished", results={"status": "ok"})
         job_updated = store.get_job(job_id)

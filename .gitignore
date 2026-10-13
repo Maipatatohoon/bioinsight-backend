@@ -1,0 +1,19 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# Virtualenvs
+.venv/
+venv/
+
+# Local runtime state
+data/
+*.sqlite
+*.db
+*.db-wal
+*.db-shm
+
+# Misc
+.DS_Store
+.env

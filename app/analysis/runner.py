@@ -12,20 +12,14 @@ class REngineRunner:
     """
     
     @staticmethod
-    def run_r_script(script_path: str, count_matrix: pd.DataFrame, metadata: pd.DataFrame, params: Dict[str, Any]) -> pd.DataFrame:
+    def run_r_script(script_path: str, counts_path: str, meta_path: str, params: Dict[str, Any]) -> pd.DataFrame:
         """
-        1. Writes count_matrix and metadata to temp CSVs.
-        2. Executes the R script.
-        3. Reads the resulting CSV.
-        4. Cleans up temp files.
+        1. Executes the R script directly on the uploaded files.
+        2. Reads the resulting CSV.
+        3. Cleans up temp output file.
         """
         with tempfile.TemporaryDirectory() as tmpdir:
-            counts_path = os.path.join(tmpdir, "counts.csv")
-            meta_path = os.path.join(tmpdir, "meta.csv")
             out_path = os.path.join(tmpdir, "results.csv")
-            
-            count_matrix.to_csv(counts_path)
-            metadata.to_csv(meta_path)
             
             # Construct R command
             # Assuming the R script takes arguments: --counts, --meta, --out, etc.

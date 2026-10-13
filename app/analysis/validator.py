@@ -27,6 +27,19 @@ def validate_analysis_input(counts_df: pd.DataFrame, meta_df: pd.DataFrame, para
     if meta_df.empty:
         raise DataValidationError("Metadata matrix is empty.")
 
+    # Normalize gene identifier column if counts_df came with gene column instead of index
+    if counts_df.columns[0].lower() in ['gene', 'gene_id', 'gene_name', 'symbol', 'id', 'ensembl_id'] or counts_df.index.dtype == 'int64':
+        first_col = counts_df.columns[0]
+        # Check if first column contains non-numeric identifiers while other columns are numeric/counts
+        if not pd.api.types.is_numeric_dtype(counts_df[first_col]):
+            counts_df = counts_df.set_index(first_col)
+
+    # Normalize sample identifier column if meta_df came with sample column instead of index
+    if meta_df.columns[0].lower() in ['sample', 'sample_id', 'id', 'run', 'gsm', 'srr'] or meta_df.index.dtype == 'int64':
+        first_col = meta_df.columns[0]
+        if not pd.api.types.is_numeric_dtype(meta_df[first_col]):
+            meta_df = meta_df.set_index(first_col)
+
     # Clean string indices / column headers
     counts_df.index = counts_df.index.astype(str).str.strip()
     counts_df.columns = counts_df.columns.astype(str).str.strip()
