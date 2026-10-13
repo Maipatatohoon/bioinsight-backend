@@ -8,6 +8,7 @@ from typing import Dict, Any, Optional, List
 import pandas as pd
 import io
 import os
+import hmac
 import tempfile
 
 from app.analysis.profiler import profile_dataset
@@ -23,9 +24,28 @@ app = FastAPI(
     description="Scientific microservice API for RNA-seq differential expression (DESeq2, edgeR, limma-voom)."
 )
 
+DEFAULT_WORKER_TOKEN = "dev-token-123"
+BIOINSIGHT_ENV = os.environ.get("BIOINSIGHT_ENV", "development")
+WORKER_TOKEN = os.environ.get("BIOINSIGHT_WORKER_TOKEN", DEFAULT_WORKER_TOKEN)
+
+if BIOINSIGHT_ENV == "production" and WORKER_TOKEN == DEFAULT_WORKER_TOKEN:
+    raise RuntimeError(
+        "BIOINSIGHT_WORKER_TOKEN must be set to a non-default value when "
+        "BIOINSIGHT_ENV=production."
+    )
+
+
+def _allowed_origins():
+    """Browser origins allowed by CORS. Configurable via BIOINSIGHT_ALLOWED_ORIGINS
+    (comma-separated); defaults to local development, never '*'."""
+    raw = os.environ.get("BIOINSIGHT_ALLOWED_ORIGINS", "")
+    origins = [o.strip() for o in raw.split(",") if o.strip()]
+    return origins or ["http://localhost:3000", "http://localhost:8000"]
+
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=_allowed_origins(),
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -201,10 +221,9 @@ def run_limma_sync(request: AnalysisRequest):
 # Worker Endpoints
 # ==============================================================================
 security = HTTPBearer()
-WORKER_TOKEN = os.environ.get("BIOINSIGHT_WORKER_TOKEN", "dev-token-123")
 
 def verify_worker(credentials: HTTPAuthorizationCredentials = Security(security)):
-    if credentials.credentials != WORKER_TOKEN:
+    if not hmac.compare_digest(credentials.credentials, WORKER_TOKEN):
         raise HTTPException(status_code=401, detail="Invalid worker token")
     return credentials.credentials
 
