@@ -2,8 +2,8 @@ fastapi
 uvicorn
 pandas
 numpy
-rpy2
 python-multipart
 pydantic
 scikit-learn
 scipy
+httpx
