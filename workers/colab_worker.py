@@ -73,7 +73,11 @@ def run_r_script(script_path: str, counts_path: str, meta_path: str, params: dic
         try:
             subprocess.run(cmd, check=True, capture_output=True, text=True)
             if os.path.exists(out_path):
-                return pd.read_csv(out_path, index_col=0)
+                df = pd.read_csv(out_path)
+                missing = [c for c in ("Gene", "log2FoldChange", "pvalue", "padj") if c not in df.columns]
+                if missing:
+                    raise RuntimeError("R output is missing required column(s): " + ", ".join(missing))
+                return df
             else:
                 raise RuntimeError("R script completed but output file is missing.")
         except subprocess.CalledProcessError as e:

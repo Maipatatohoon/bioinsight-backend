@@ -50,21 +50,24 @@ fit <- glmQLFit(dge, design_mat)
 # 5. Contrast Testing
 if (nchar(args$contrast) > 0) {
   parts <- unlist(strsplit(args$contrast, "_vs_"))
-  if (length(parts) == 2) {
-    sub_parts <- unlist(strsplit(parts[1], "_"))
-    factor_name <- sub_parts[1]
-    num_level <- paste(sub_parts[-1], collapse="_")
-    den_level <- parts[2]
-    
-    coef_name <- paste0(factor_name, num_level)
-    if (coef_name %in% colnames(design_mat)) {
-      qlf <- glmQLFTest(fit, coef=coef_name)
-    } else {
-      qlf <- glmQLFTest(fit, coef=2)
-    }
-  } else {
-    qlf <- glmQLFTest(fit, coef=2)
+  if (length(parts) != 2) {
+    stop(sprintf("Unrecognised contrast '%s' (expected factor_level_vs_level).", args$contrast))
   }
+  sub_parts <- unlist(strsplit(parts[1], "_"))
+  factor_name <- sub_parts[1]
+  num_level <- paste(sub_parts[-1], collapse="_")
+  den_level <- parts[2]
+  num_coef <- paste0(factor_name, num_level)
+  den_coef <- paste0(factor_name, den_level)
+
+  cv <- setNames(rep(0, ncol(design_mat)), colnames(design_mat))
+  if (num_coef %in% names(cv)) cv[num_coef] <- cv[num_coef] + 1
+  if (den_coef %in% names(cv)) cv[den_coef] <- cv[den_coef] - 1
+  if (!(num_coef %in% names(cv)) && !(den_coef %in% names(cv))) {
+    stop(sprintf("Contrast '%s' does not match the design matrix columns: %s",
+                 args$contrast, paste(colnames(design_mat), collapse=", ")))
+  }
+  qlf <- glmQLFTest(fit, contrast=cv)
 } else {
   qlf <- glmQLFTest(fit, coef=2)
 }

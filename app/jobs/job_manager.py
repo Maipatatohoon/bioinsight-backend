@@ -283,9 +283,45 @@ class ColabRuntime(ComputeRuntime):
         store.update_job(job_id, JobState.QUEUED, 30, "Validation complete. Waiting for Colab compute worker to claim job.")
 
 class LocalRuntime(ComputeRuntime):
-    """(Future) Runs the job locally using subprocess."""
+    """Runs the job on this machine by invoking the R engines via Rscript."""
     def dispatch(self, store: JobStore, job_id: str):
-        pass
+        job = store.get_job(job_id)
+        if not job:
+            return
+        counts_path = job["counts_path"] + ".clean.csv"
+        meta_path = job["metadata_path"] + ".clean.csv"
+        app_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        engines = [
+            ("deseq2", os.path.join(app_dir, "deseq2", "deseq2_script.R")),
+            ("edger", os.path.join(app_dir, "edger", "edger_script.R")),
+            ("limma", os.path.join(app_dir, "limma", "limma_script.R")),
+        ]
+        params = job.get("params", {}) or {}
+        results = {}
+        warnings = []
+        for i, (name, script) in enumerate(engines):
+            progress = 40 + int(40 * i / len(engines))
+            store.update_job(job_id, JobState.RUNNING, progress, f"Running {name} locally...")
+            try:
+                df = REngineRunner.run_r_script(script, counts_path, meta_path, params)
+                df = df.where(pd.notnull(df), None)
+                results[name] = df.to_dict(orient="records")
+            except Exception as e:  # one engine failing must not sink the others
+                warnings.append(f"{name}: {e}")
+        if not results:
+            store.update_job(
+                job_id, JobState.FAILED, 0,
+                "All R engines failed on the local runtime.",
+                error="; ".join(warnings) or "no engine produced results",
+            )
+            return
+        store.update_job(job_id, JobState.RUNNING, 95, "Saving results...")
+        ok = store.update_job_results_atomic(job_id, results, warnings=warnings, worker_id="local")
+        if not ok:
+            store.update_job(
+                job_id, JobState.COMPLETED, 100, "Analysis completed (local).",
+                warnings=warnings, results=results,
+            )
 
 class CloudRuntime(ComputeRuntime):
     """(Future) Runs the job on AWS/GCP Batch."""
@@ -324,7 +360,8 @@ def process_job_async(job_id: str):
         clean_meta.to_csv(clean_meta_path)
 
         # Dispatch via the configured runtime
-        runtime = ColabRuntime()
+        runtime_name = os.environ.get("BIOINSIGHT_RUNTIME", "colab").strip().lower()
+        runtime = LocalRuntime() if runtime_name == "local" else ColabRuntime()
         runtime.dispatch(store, job_id)
 
     except DataValidationError as e:

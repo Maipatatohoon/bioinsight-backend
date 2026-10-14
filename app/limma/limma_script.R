@@ -48,22 +48,38 @@ v <- voom(dge, design_mat, plot=FALSE)
 fit <- lmFit(v, design_mat)
 
 # 5. Contrast Testing & Empirical Bayes Moderation
-coef_idx <- 2
+use_contrast <- FALSE
+cv <- NULL
 if (nchar(args$contrast) > 0) {
   parts <- unlist(strsplit(args$contrast, "_vs_"))
-  if (length(parts) == 2) {
-    sub_parts <- unlist(strsplit(parts[1], "_"))
-    factor_name <- sub_parts[1]
-    num_level <- paste(sub_parts[-1], collapse="_")
-    coef_name <- paste0(factor_name, num_level)
-    if (coef_name %in% colnames(design_mat)) {
-      coef_idx <- coef_name
-    }
+  if (length(parts) != 2) {
+    stop(sprintf("Unrecognised contrast '%s' (expected factor_level_vs_level).", args$contrast))
   }
+  sub_parts <- unlist(strsplit(parts[1], "_"))
+  factor_name <- sub_parts[1]
+  num_level <- paste(sub_parts[-1], collapse="_")
+  den_level <- parts[2]
+  num_coef <- paste0(factor_name, num_level)
+  den_coef <- paste0(factor_name, den_level)
+
+  cv <- setNames(rep(0, ncol(design_mat)), colnames(design_mat))
+  if (num_coef %in% names(cv)) cv[num_coef] <- cv[num_coef] + 1
+  if (den_coef %in% names(cv)) cv[den_coef] <- cv[den_coef] - 1
+  if (!(num_coef %in% names(cv)) && !(den_coef %in% names(cv))) {
+    stop(sprintf("Contrast '%s' does not match the design matrix columns: %s",
+                 args$contrast, paste(colnames(design_mat), collapse=", ")))
+  }
+  use_contrast <- TRUE
 }
 
-fit2 <- eBayes(fit)
-res_table <- topTable(fit2, number=Inf, coef=coef_idx)
+if (use_contrast) {
+  cvm <- matrix(cv, ncol=1, dimnames=list(colnames(design_mat), "contrast"))
+  fit2 <- eBayes(contrasts.fit(fit, cvm))
+  res_table <- topTable(fit2, number=Inf)
+} else {
+  fit2 <- eBayes(fit)
+  res_table <- topTable(fit2, number=Inf, coef=2)
+}
 res_table$Gene <- rownames(res_table)
 
 # Map limma columns to standard BioInsight 360 backend schema
