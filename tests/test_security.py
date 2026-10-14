@@ -43,6 +43,12 @@ class BackendConfigTest(unittest.TestCase):
         self.assertIn("http://localhost:3000", origins)
         self.assertNotIn("*", origins)
 
+    def test_allowed_origins_star(self):
+        os.environ["BIOINSIGHT_ALLOWED_ORIGINS"] = "*"
+        m = self._reload()
+        self.assertEqual(m._allowed_origins(), ["*"])
+        self.assertEqual(m._CORS_ORIGINS, ["*"])
+
     def test_production_refuses_default_token(self):
         os.environ["BIOINSIGHT_ENV"] = "production"
         os.environ.pop("BIOINSIGHT_WORKER_TOKEN", None)

@@ -38,16 +38,21 @@ if BIOINSIGHT_ENV == "production" and WORKER_TOKEN == DEFAULT_WORKER_TOKEN:
 
 def _allowed_origins():
     """Browser origins allowed by CORS. Configurable via BIOINSIGHT_ALLOWED_ORIGINS
-    (comma-separated); defaults to local development, never '*'."""
-    raw = os.environ.get("BIOINSIGHT_ALLOWED_ORIGINS", "")
+    (comma-separated, or '*' to allow any). Defaults to local development."""
+    raw = os.environ.get("BIOINSIGHT_ALLOWED_ORIGINS", "").strip()
+    if raw == "*":
+        return ["*"]
     origins = [o.strip() for o in raw.split(",") if o.strip()]
     return origins or ["http://localhost:3000", "http://localhost:8000"]
 
 
+_CORS_ORIGINS = _allowed_origins()
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=_allowed_origins(),
-    allow_credentials=True,
+    allow_origins=_CORS_ORIGINS,
+    # '*' cannot be combined with credentials; we don't send credentials from the UI.
+    allow_credentials=("*" not in _CORS_ORIGINS),
     allow_methods=["*"],
     allow_headers=["*"],
 )
