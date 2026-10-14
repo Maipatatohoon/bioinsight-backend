@@ -14,6 +14,7 @@ import tempfile
 from app.analysis.profiler import profile_dataset
 from app.analysis.models import ProfilingReport
 from app.analysis.runner import REngineRunner
+from app.analysis.enrichment import enrich_genes
 from app.jobs.job_manager import JobStore, JobState, process_job_async
 from app.storage import save_upload
 import json
@@ -216,6 +217,28 @@ def run_limma_sync(request: AnalysisRequest):
         return _run_sync_engine(("limma", "limma_script.R"), request)
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"limma-voom analysis failed: {str(e)}")
+
+# ==============================================================================
+# Enrichment / interpretation
+# ==============================================================================
+class EnrichmentRequest(BaseModel):
+    genes: List[str]
+    annotations: Dict[str, Any]
+    universe: Optional[List[str]] = None
+    min_term_size: int = 3
+    max_term_size: int = 500
+
+@app.post("/api/enrichment")
+def run_enrichment(request: EnrichmentRequest):
+    """Over-representation analysis of a gene list against supplied annotations."""
+    results = enrich_genes(
+        request.genes,
+        request.annotations,
+        universe=request.universe,
+        min_term_size=request.min_term_size,
+        max_term_size=request.max_term_size,
+    )
+    return {"count": len(results), "results": results}
 
 # ==============================================================================
 # Worker Endpoints

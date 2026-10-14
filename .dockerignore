@@ -1,0 +1,11 @@
+.git/
+.venv/
+venv/
+__pycache__/
+*.pyc
+data/
+tests/
+*.sqlite
+*.db
+.env
+.DS_Store

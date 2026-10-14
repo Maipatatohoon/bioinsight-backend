@@ -1,0 +1,22 @@
+# Run the BioInsight 360 backend locally with Docker.
+#   docker compose up --build
+# Leave BIOINSIGHT_RUNTIME=colab (default) so a worker (e.g. the Colab notebook)
+# claims jobs; set BIOINSIGHT_RUNTIME=local to run the R engines in this container.
+services:
+  backend:
+    build: .
+    image: bioinsight-backend
+    ports:
+      - "7860:7860"
+    environment:
+      BIOINSIGHT_WORKER_TOKEN: ${BIOINSIGHT_WORKER_TOKEN:-change-me}
+      BIOINSIGHT_ENV: ${BIOINSIGHT_ENV:-development}
+      BIOINSIGHT_DB_PATH: /data/bioinsight_jobs.db
+      BIOINSIGHT_RUNTIME: ${BIOINSIGHT_RUNTIME:-colab}
+      BIOINSIGHT_ALLOWED_ORIGINS: ${BIOINSIGHT_ALLOWED_ORIGINS:-http://localhost:3000}
+    volumes:
+      - bioinsight-data:/data
+    restart: unless-stopped
+
+volumes:
+  bioinsight-data:
