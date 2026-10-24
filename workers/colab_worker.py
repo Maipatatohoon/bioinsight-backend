@@ -1,4 +1,5 @@
 import os
+import re
 import sys
 import time
 import uuid
@@ -23,6 +24,41 @@ HEADERS = {
 
 def print_log(msg: str):
     print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] [{WORKER_ID}] {msg}", flush=True)
+
+
+def _normalise_design(params: dict, meta_path: str) -> dict:
+    """Match design/contrast factor names to the cleaned metadata columns.
+
+    The API stores the grouping column as `condition` in the .clean.csv. Older
+    callers still send the original name (e.g. `~ Group`); rewrite it so the R
+    engines do not fail with "object 'Group' not found".
+    """
+    try:
+        columns = list(pd.read_csv(meta_path, nrows=0).columns)
+    except Exception:
+        return params
+    target = "condition" if "condition" in columns else next(
+        (c for c in columns if c.lower() not in ("sample", "sample_id", "id")), None
+    )
+    if not target:
+        return params
+
+    params = dict(params or {})
+    design = str(params.get("design") or f"~ {target}")
+    rhs = design.split("~", 1)[1] if "~" in design else design
+    rhs = re.sub(
+        r"[A-Za-z_.][A-Za-z0-9_.]*",
+        lambda match: match.group(0) if match.group(0) in columns else target,
+        rhs,
+    )
+    params["design"] = "~ " + rhs.strip()
+
+    contrast = params.get("contrast")
+    if isinstance(contrast, str) and contrast:
+        factor, sep, rest = contrast.partition("_")
+        if sep and factor and factor not in columns:
+            params["contrast"] = f"{target}_" + rest
+    return params
 
 def get_session():
     s = requests.Session()
@@ -101,7 +137,9 @@ def process_job(job_id: str, params: dict):
         r_meta.raise_for_status()
         with open(meta_path, "wb") as f:
             f.write(r_meta.content)
-            
+
+        params = _normalise_design(params, meta_path)
+
         # Locate R scripts
         base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
         deseq2_script = os.path.join(base_dir, "app", "deseq2", "deseq2_script.R")

@@ -9,6 +9,7 @@ import pandas as pd
 import io
 import os
 import hmac
+import math
 import tempfile
 
 from app.analysis.profiler import profile_dataset
@@ -24,6 +25,24 @@ app = FastAPI(
     version="2.0.0",
     description="Scientific microservice API for RNA-seq differential expression (DESeq2, edgeR, limma-voom)."
 )
+
+
+def _json_safe(value):
+    """Replace NaN/Infinity with null so Starlette can render strict JSON.
+
+    DESeq2/edgeR/limma legitimately return NA for all-zero or filtered genes.
+    pandas turns those into NaN (and occasionally +/-Inf for log2FC), which are
+    valid Python floats but invalid JSON. FastAPI/Starlette then raises
+    "Out of range float values are not JSON compliant" and the whole results
+    request fails with a 500. Emitting null instead lets the UI skip the row.
+    """
+    if isinstance(value, float):
+        return value if math.isfinite(value) else None
+    if isinstance(value, dict):
+        return {key: _json_safe(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_safe(item) for item in value]
+    return value
 
 DEFAULT_WORKER_TOKEN = "dev-token-123"
 BIOINSIGHT_ENV = os.environ.get("BIOINSIGHT_ENV", "development")
@@ -126,7 +145,7 @@ def get_job_status(job_id: str):
     if not job:
         raise HTTPException(status_code=404, detail=f"Job ID '{job_id}' not found.")
     
-    return {
+    return _json_safe({
         "job_id": job["job_id"],
         "state": job["state"],
         "progress": job["progress"],
@@ -136,7 +155,7 @@ def get_job_status(job_id: str):
         "created_at": job["created_at"],
         "updated_at": job["updated_at"],
         "qc_data": job.get("qc_data")
-    }
+    })
 
 @app.get("/api/analysis/{job_id}/results")
 def get_job_results(job_id: str):
@@ -147,12 +166,12 @@ def get_job_results(job_id: str):
     if job["state"] != JobState.COMPLETED:
         raise HTTPException(status_code=400, detail=f"Job '{job_id}' is not complete yet. Current state: {job['state']}")
     
-    return {
+    return _json_safe({
         "job_id": job_id,
         "status": "success",
         "warnings": job["warnings"],
         "results": job["results"]
-    }
+    })
 
 @app.post("/api/analysis/{job_id}/cancel")
 def cancel_job(job_id: str):

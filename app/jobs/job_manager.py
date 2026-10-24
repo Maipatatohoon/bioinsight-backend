@@ -11,11 +11,47 @@ import sqlite3
 import pandas as pd
 import numpy as np
 import os
+import re
 import json
 from typing import Dict, Any, Optional, List
 from app.analysis.validator import validate_analysis_input, DataValidationError
 from app.analysis.runner import REngineRunner
 from app.analysis.qc import compute_qc_metrics
+
+
+def _normalise_design_params(params: Dict[str, Any], meta_path: str) -> Dict[str, Any]:
+    """Make design/contrast match the cleaned metadata column names.
+
+    validate_analysis_input() renames whichever grouping column was resolved to
+    ``condition``. Callers that still send the original name (e.g. the older
+    frontend sent ``~ Group``) would otherwise fail with
+    "object 'Group' not found". Rewrite unknown factor names to ``condition``.
+    """
+    params = dict(params or {})
+    try:
+        columns = list(pd.read_csv(meta_path, nrows=0).columns)
+    except Exception:
+        return params
+    if "condition" not in columns:
+        return params
+
+    design = str(params.get("design") or "~ condition")
+    rhs = design.split("~", 1)[1] if "~" in design else design
+    rhs = re.sub(
+        r"[A-Za-z_.][A-Za-z0-9_.]*",
+        lambda m: m.group(0) if m.group(0) in columns else "condition",
+        rhs,
+    )
+    params["design"] = "~ " + rhs.strip()
+    params["condition_col"] = "condition"
+
+    contrast = params.get("contrast")
+    if isinstance(contrast, str) and contrast:
+        factor, sep, rest = contrast.partition("_")
+        if sep and factor and factor not in columns:
+            params["contrast"] = "condition_" + rest
+    return params
+
 
 class JobState:
     QUEUED = "QUEUED"
@@ -296,7 +332,7 @@ class LocalRuntime(ComputeRuntime):
             ("edger", os.path.join(app_dir, "edger", "edger_script.R")),
             ("limma", os.path.join(app_dir, "limma", "limma_script.R")),
         ]
-        params = job.get("params", {}) or {}
+        params = _normalise_design_params(job.get("params", {}) or {}, meta_path)
         results = {}
         warnings = []
         for i, (name, script) in enumerate(engines):
