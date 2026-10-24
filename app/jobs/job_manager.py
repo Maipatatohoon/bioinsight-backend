@@ -49,8 +49,8 @@ class JobStore:
             cls._instance = inst
         return cls._instance
 
-    @staticmethod
-    def _default_db_path() -> str:
+    @classmethod
+    def _default_db_path(cls) -> str:
         # app/jobs/job_manager.py -> app/jobs -> app -> backend
         backend_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
         return os.path.join(backend_root, "data", cls._DEFAULT_DB_FILENAME)
