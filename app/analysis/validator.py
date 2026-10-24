@@ -99,6 +99,14 @@ def validate_analysis_input(counts_df: pd.DataFrame, meta_df: pd.DataFrame, para
         else:
             raise DataValidationError(f"Condition column '{condition_col}' not found in metadata columns: {list(meta_df.columns)}.")
 
+    # The R engines build their design formula around a column literally named
+    # `condition` (the --design default in app/*/*.R). Normalise whichever
+    # grouping column we resolved so metadata using `group`, `treatment`, etc.
+    # does not fail with "object 'condition' not found".
+    if condition_col != "condition":
+        meta_df = meta_df.rename(columns={condition_col: "condition"})
+        condition_col = "condition"
+
     counts_per_group = meta_df[condition_col].value_counts()
     for group_name, count in counts_per_group.items():
         if count < 2:
