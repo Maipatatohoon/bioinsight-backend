@@ -16,7 +16,10 @@ from app.analysis.profiler import profile_dataset
 from app.analysis.models import ProfilingReport
 from app.analysis.runner import REngineRunner
 from app.analysis.enrichment import enrich_genes
-from app.jobs.job_manager import JobStore, JobState, process_job_async
+from app.analysis.comparison import compute_comparison
+from app.jobs.job_manager import (
+    JobStore, JobState, process_job_async, ensure_methods, ENGINES, CORE_ENGINES,
+)
 from app.storage import save_upload
 import json
 
@@ -118,16 +121,34 @@ def submit_analysis_job(
     metadata_file: UploadFile = File(...),
     params: str = Form("{}")
 ):
-    counts_path = save_upload(counts_file, "counts")
-    metadata_path = save_upload(metadata_file, "metadata")
-    
     parsed_params = {}
     if params:
         try:
             parsed_params = json.loads(params)
         except json.JSONDecodeError:
             raise HTTPException(status_code=400, detail="Invalid JSON in params")
-            
+    if not isinstance(parsed_params, dict):
+        raise HTTPException(status_code=400, detail="params must be a JSON object.")
+
+    # Direction is part of the scientific result. Do not let an ambiguous
+    # request fall back to alphabetical factor levels inside DESeq2/edgeR.
+    control = str(parsed_params.get("control_group") or "").strip()
+    treated = str(parsed_params.get("treated_group") or "").strip()
+    if not control or not treated:
+        raise HTTPException(
+            status_code=400,
+            detail="control_group and treated_group are required for raw-count analysis.",
+        )
+    if control == treated:
+        raise HTTPException(status_code=400, detail="control_group and treated_group must differ.")
+    parsed_params["control_group"] = control
+    parsed_params["treated_group"] = treated
+
+    # Save only after the request has passed the direction checks, so a rejected
+    # submission cannot leave orphaned upload files.
+    counts_path = save_upload(counts_file, "counts")
+    metadata_path = save_upload(metadata_file, "metadata")
+
     store = JobStore()
     job_id = store.create_job(counts_path, metadata_path, parsed_params)
     background_tasks.add_task(process_job_async, job_id)
@@ -144,7 +165,8 @@ def get_job_status(job_id: str):
     job = store.get_job(job_id)
     if not job:
         raise HTTPException(status_code=404, detail=f"Job ID '{job_id}' not found.")
-    
+
+    results = job.get("results") or {}
     return _json_safe({
         "job_id": job["job_id"],
         "state": job["state"],
@@ -154,23 +176,73 @@ def get_job_status(job_id: str):
         "error": job["error"],
         "created_at": job["created_at"],
         "updated_at": job["updated_at"],
+        "params": job.get("params") or {},
+        "methods": ensure_methods(job),
+        "results_available": sorted(results.keys()),
+        "comparison_available": bool(job.get("comparison")),
         "qc_data": job.get("qc_data")
     })
 
 @app.get("/api/analysis/{job_id}/results")
 def get_job_results(job_id: str):
+    """Return whatever method tables are saved, even while another is running.
+
+    This is the key contract for individual-method results: DESeq2 must be
+    viewable as soon as it finishes, without waiting for edgeR or a consensus.
+    The response is marked ``partial`` until both core methods are complete.
+    """
     store = JobStore()
     job = store.get_job(job_id)
     if not job:
         raise HTTPException(status_code=404, detail=f"Job ID '{job_id}' not found.")
-    if job["state"] != JobState.COMPLETED:
-        raise HTTPException(status_code=400, detail=f"Job '{job_id}' is not complete yet. Current state: {job['state']}")
-    
+
+    results = job.get("results") or {}
+    if not results:
+        return _json_safe({
+            "job_id": job_id,
+            "status": "pending",
+            "state": job["state"],
+            "methods": ensure_methods(job),
+            "warnings": job["warnings"],
+            "error": job["error"],
+            "results": {},
+        })
+
     return _json_safe({
         "job_id": job_id,
-        "status": "success",
+        "status": "success" if job["state"] == JobState.COMPLETED else "partial",
+        "state": job["state"],
+        "methods": ensure_methods(job),
         "warnings": job["warnings"],
-        "results": job["results"]
+        "error": job["error"],
+        "results": results,
+    })
+
+
+@app.get("/api/analysis/{job_id}/method/{engine}")
+def get_method_results(job_id: str, engine: str):
+    """Return one engine's saved table without requiring the other engine."""
+    engine = engine.lower()
+    if engine not in ENGINES:
+        raise HTTPException(status_code=400, detail=f"Unknown engine '{engine}'. Choose one of: {', '.join(ENGINES)}.")
+    store = JobStore()
+    job = store.get_job(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail=f"Job ID '{job_id}' not found.")
+    results = job.get("results") or {}
+    if engine not in results:
+        method = ensure_methods(job).get(engine, {})
+        raise HTTPException(
+            status_code=404,
+            detail=f"{engine} results are not available yet (status: {method.get('status', 'pending')}).",
+        )
+    return _json_safe({
+        "job_id": job_id,
+        "engine": engine,
+        "state": job["state"],
+        "methods": ensure_methods(job),
+        "warnings": job["warnings"],
+        "results": results[engine],
     })
 
 @app.post("/api/analysis/{job_id}/cancel")
@@ -185,22 +257,96 @@ def cancel_job(job_id: str):
 def download_job_results_csv(job_id: str, engine: Optional[str] = "deseq2"):
     store = JobStore()
     job = store.get_job(job_id)
-    if not job or job["state"] != JobState.COMPLETED:
-        raise HTTPException(status_code=404, detail=f"Completed job '{job_id}' not found.")
-    
-    results = job.get("results", {})
-    engine_data = results.get(engine.lower())
+    if not job:
+        raise HTTPException(status_code=404, detail=f"Job '{job_id}' not found.")
+
+    engine_name = (engine or "deseq2").lower()
+    if engine_name not in ENGINES:
+        raise HTTPException(status_code=400, detail=f"Unknown engine '{engine_name}'.")
+    results = job.get("results") or {}
+    engine_data = results.get(engine_name)
     if not engine_data:
-        raise HTTPException(status_code=404, detail=f"Engine '{engine}' results not available for job '{job_id}'.")
-    
+        raise HTTPException(status_code=404, detail=f"Engine '{engine_name}' results not available for job '{job_id}'.")
+
     df = pd.DataFrame(engine_data)
     stream = io.StringIO()
     df.to_csv(stream, index=False)
-    
+
     return Response(
         content=stream.getvalue(),
         media_type="text/csv",
-        headers={"Content-Disposition": f"attachment; filename=bioinsight_{engine}_results_{job_id[:8]}.csv"}
+        headers={"Content-Disposition": f"attachment; filename=bioinsight_{engine_name}_results_{job_id[:8]}.csv"}
+    )
+
+
+# ==============================================================================
+# Optional comparison (computed from the two saved result tables)
+# ==============================================================================
+class ComparisonRequest(BaseModel):
+    padj_threshold: float = 0.05
+    log2fc_threshold: float = 1.0
+
+
+@app.post("/api/analysis/{job_id}/comparison")
+def create_comparison(job_id: str, request: ComparisonRequest = ComparisonRequest()):
+    store = JobStore()
+    job = store.get_job(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail=f"Job ID '{job_id}' not found.")
+    results = job.get("results") or {}
+    missing = [engine for engine in CORE_ENGINES if not results.get(engine)]
+    if missing:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "The comparison needs saved DESeq2 and edgeR results. Missing: "
+                + ", ".join(missing)
+            ),
+        )
+    try:
+        comparison = compute_comparison(
+            results["deseq2"],
+            results["edger"],
+            padj_threshold=request.padj_threshold,
+            log2fc_threshold=request.log2fc_threshold,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    comparison["job_id"] = job_id
+    if not store.save_comparison(job_id, comparison):
+        raise HTTPException(status_code=500, detail="Could not save the comparison.")
+    return _json_safe({"status": "success", "comparison": comparison})
+
+
+@app.get("/api/analysis/{job_id}/comparison")
+def get_comparison(job_id: str):
+    store = JobStore()
+    job = store.get_job(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail=f"Job ID '{job_id}' not found.")
+    comparison = job.get("comparison")
+    if not comparison:
+        raise HTTPException(status_code=404, detail="No comparison has been computed for this job yet.")
+    return _json_safe({"status": "success", "comparison": comparison})
+
+
+@app.get("/api/analysis/{job_id}/comparison.csv")
+def download_comparison_csv(job_id: str):
+    store = JobStore()
+    job = store.get_job(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail=f"Job ID '{job_id}' not found.")
+    comparison = job.get("comparison")
+    if not comparison:
+        raise HTTPException(status_code=404, detail="No comparison has been computed for this job yet.")
+    rows = comparison.get("rows") or []
+    df = pd.DataFrame(rows)
+    stream = io.StringIO()
+    df.to_csv(stream, index=False)
+    return Response(
+        content=stream.getvalue(),
+        media_type="text/csv",
+        headers={"Content-Disposition": f"attachment; filename=bioinsight_comparison_{job_id[:8]}.csv"}
     )
 
 # Synchronous endpoints for legacy backwards compatibility
@@ -287,6 +433,16 @@ class WorkerResultsRequest(BaseModel):
     warnings: Optional[List[str]] = []
     worker_id: str
 
+class WorkerMethodRequest(BaseModel):
+    worker_id: str
+    status: str = "completed"
+    results: Optional[List[Dict[str, Any]]] = None
+    error: Optional[str] = None
+
+class WorkerFinishRequest(BaseModel):
+    worker_id: Optional[str] = None
+    warnings: Optional[List[str]] = []
+
 @app.post("/api/workers/register")
 def register_worker(req: WorkerRegisterRequest, token: str = Depends(verify_worker)):
     store = JobStore()
@@ -362,6 +518,51 @@ def upload_results(job_id: str, req: WorkerResultsRequest, token: str = Depends(
         raise HTTPException(status_code=409, detail=f"Failed to submit results: job is now in {current_state} state")
         
     return {"status": "saved"}
+
+@app.post("/api/workers/jobs/{job_id}/method/{engine}")
+def upload_method_result(job_id: str, engine: str, req: WorkerMethodRequest, token: str = Depends(verify_worker)):
+    """Persist one engine's status/result as soon as it finishes.
+
+    This lets the browser show DESeq2 while edgeR is still running, and keeps a
+    genuine edgeR failure separate from a successful DESeq2 result.
+    """
+    engine = engine.lower()
+    if engine not in ENGINES:
+        raise HTTPException(status_code=400, detail=f"Unknown engine '{engine}'.")
+    if req.status not in ("running", "completed", "failed"):
+        raise HTTPException(status_code=400, detail="status must be running, completed, or failed.")
+    if req.status == "completed" and req.results is None:
+        raise HTTPException(status_code=400, detail="Completed method uploads require a results table.")
+    if req.status == "failed" and not req.error:
+        raise HTTPException(status_code=400, detail="Failed method uploads require an error message.")
+
+    job = JobStore().get_job(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+    updated = JobStore().update_job_method(
+        job_id,
+        engine,
+        req.status,
+        results=req.results,
+        error=req.error,
+        worker_id=req.worker_id,
+    )
+    if updated is None:
+        raise HTTPException(status_code=409, detail="Job is finished, cancelled, or owned by another worker.")
+    return {"status": req.status, "engine": engine, "job_state": updated["state"]}
+
+
+@app.post("/api/workers/jobs/{job_id}/finish")
+def finish_job(job_id: str, req: WorkerFinishRequest, token: str = Depends(verify_worker)):
+    """Finalise per-method uploads without re-sending the large result tables."""
+    job = JobStore().get_job(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+    state = JobStore().finish_job(job_id, worker_id=req.worker_id, warnings=req.warnings)
+    if state is None:
+        raise HTTPException(status_code=409, detail="Job is already finished or owned by another worker.")
+    return {"status": "finished", "job_state": state}
+
 
 @app.post("/api/workers/jobs/{job_id}/failed")
 def mark_job_failed(job_id: str, error: str = Form(...), token: str = Depends(verify_worker)):

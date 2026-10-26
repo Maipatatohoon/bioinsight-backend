@@ -50,10 +50,13 @@ class TestJobManager(unittest.TestCase):
         self.assertTrue(success)
         
         completed = store.get_job(job_id)
-        self.assertEqual(completed["state"], JobState.COMPLETED)
+        self.assertEqual(completed["state"], JobState.PARTIALLY_COMPLETED)
         self.assertEqual(completed["progress"], 100)
         self.assertIn("deseq2", completed["results"])
         self.assertIn("Low count warning", completed["warnings"])
+        # The aggregate upload is final: a core method absent from it must not
+        # remain in a misleading "pending" state.
+        self.assertEqual(completed["methods"]["edger"]["status"], "failed")
 
         # Test duplicate result submission is rejected
         dup_success = store.update_job_results_atomic(job_id, results_payload)

@@ -104,10 +104,12 @@ def run_r_script(script_path: str, counts_path: str, meta_path: str, params: dic
             "--meta", meta_path,
             "--out", out_path,
             "--design", params.get("design", "~ condition"),
-            "--contrast", params.get("contrast", "")
+            "--contrast", params.get("contrast", ""),
+            "--numerator", str(params.get("treated_group", "")),
+            "--denominator", str(params.get("control_group", "")),
         ]
         try:
-            subprocess.run(cmd, check=True, capture_output=True, text=True)
+            subprocess.run(cmd, check=True, capture_output=True, text=True, timeout=900)
             if os.path.exists(out_path):
                 df = pd.read_csv(out_path)
                 missing = [c for c in ("Gene", "log2FoldChange", "pvalue", "padj") if c not in df.columns]
@@ -118,6 +120,75 @@ def run_r_script(script_path: str, counts_path: str, meta_path: str, params: dic
                 raise RuntimeError("R script completed but output file is missing.")
         except subprocess.CalledProcessError as e:
             raise RuntimeError(f"R script failed: {e.stderr}")
+
+def _records(df: pd.DataFrame):
+    """Convert a result frame to JSON-safe records (NaN/Inf -> null)."""
+    clean = df.replace([float("inf"), float("-inf")], float("nan"))
+    clean = clean.astype(object).where(pd.notnull(clean), None)
+    return clean.to_dict(orient="records")
+
+
+def _post_method(job_id: str, engine: str, status: str, results=None, error=None) -> bool:
+    """Report one method's state. Returns False when the backend is too old."""
+    payload = {"worker_id": WORKER_ID, "status": status}
+    if results is not None:
+        payload["results"] = results
+    if error is not None:
+        payload["error"] = error
+    try:
+        response = http_session.post(
+            f"{BACKEND_URL}/api/workers/jobs/{job_id}/method/{engine}",
+            json=payload,
+            headers=HEADERS,
+            timeout=120,
+        )
+        if response.status_code in (404, 405):
+            return False
+        response.raise_for_status()
+        return True
+    except requests.exceptions.RequestException as exc:
+        print_log(f"Could not report {engine} {status}: {exc}")
+        return False
+
+
+def _post_finish(job_id: str, warnings: list) -> bool:
+    try:
+        response = http_session.post(
+            f"{BACKEND_URL}/api/workers/jobs/{job_id}/finish",
+            json={"worker_id": WORKER_ID, "warnings": warnings},
+            headers=HEADERS,
+            timeout=30,
+        )
+        if response.status_code in (404, 405):
+            return False
+        response.raise_for_status()
+        return True
+    except requests.exceptions.RequestException as exc:
+        print_log(f"Could not finalize job: {exc}")
+        return False
+
+
+def _upload_legacy(job_id: str, results: dict, warnings: list):
+    """Fallback for an older backend without per-method endpoints."""
+    payload = {"worker_id": WORKER_ID, "results": results, "warnings": warnings}
+    response = http_session.post(
+        f"{BACKEND_URL}/api/workers/jobs/{job_id}/results",
+        json=payload,
+        headers=HEADERS,
+        timeout=120,
+    )
+    response.raise_for_status()
+
+
+def _is_cancelled(job_id: str) -> bool:
+    try:
+        response = http_session.get(f"{BACKEND_URL}/api/analysis/{job_id}", timeout=15)
+        if response.status_code == 200:
+            return response.json().get("state") == "CANCELLED"
+    except Exception as exc:
+        print_log(f"Status check failed: {exc}. Continuing.")
+    return False
+
 
 def process_job(job_id: str, params: dict):
     print_log(f"Processing job {job_id}")
@@ -146,60 +217,57 @@ def process_job(job_id: str, params: dict):
         edger_script = os.path.join(base_dir, "app", "edger", "edger_script.R")
         limma_script = os.path.join(base_dir, "app", "limma", "limma_script.R")
 
+        engines = [
+            ("deseq2", deseq2_script),
+            ("edger", edger_script),
+            ("limma", limma_script),
+        ]
         results_dict = {}
         warnings = []
+        legacy = False
 
-        # Run DESeq2
-        try:
-            print_log("Running DESeq2...")
-            df = run_r_script(deseq2_script, counts_path, meta_path, params)
-            df = df.where(pd.notnull(df), None)
-            results_dict["deseq2"] = df.to_dict(orient="records")
-        except Exception as e:
-            warnings.append(f"DESeq2: {str(e)}")
+        for engine, script in engines:
+            if _is_cancelled(job_id):
+                print_log(f"Job {job_id} was cancelled. Discarding remaining work.")
+                return
+            if not legacy:
+                if not _post_method(job_id, engine, "running"):
+                    print_log("Per-method API unavailable; falling back to the legacy all-at-once upload.")
+                    legacy = True
+            try:
+                print_log(f"Running {engine}...")
+                df = run_r_script(script, counts_path, meta_path, params)
+                table = _records(df)
+                results_dict[engine] = table
+                print_log(f"{engine} completed: {len(table)} genes.")
+                if not legacy and not _post_method(job_id, engine, "completed", results=table):
+                    # The backend accepted the per-method protocol but this
+                    # table did not persist. Fall back to the legacy aggregate
+                    # upload for this and every remaining engine so a network
+                    # hiccup cannot silently lose a completed result.
+                    print_log("Could not save this method incrementally; falling back to aggregate upload.")
+                    legacy = True
+            except Exception as e:
+                warnings.append(f"{engine}: {str(e)}")
+                print_log(f"{engine} failed: {e}")
+                if not legacy:
+                    _post_method(job_id, engine, "failed", error=str(e))
 
-        # Run edgeR
-        try:
-            print_log("Running edgeR...")
-            df = run_r_script(edger_script, counts_path, meta_path, params)
-            df = df.where(pd.notnull(df), None)
-            results_dict["edger"] = df.to_dict(orient="records")
-        except Exception as e:
-            warnings.append(f"edgeR: {str(e)}")
+        if _is_cancelled(job_id):
+            print_log(f"Job {job_id} was cancelled. Discarding results.")
+            return
 
-        # Run limma
-        try:
-            print_log("Running limma...")
-            df = run_r_script(limma_script, counts_path, meta_path, params)
-            df = df.where(pd.notnull(df), None)
-            results_dict["limma"] = df.to_dict(orient="records")
-        except Exception as e:
-            warnings.append(f"limma: {str(e)}")
+        if legacy:
+            print_log("Uploading aggregate results to legacy endpoint...")
+            _upload_legacy(job_id, results_dict, warnings)
+            print_log(f"Job {job_id} finalized through the legacy endpoint.")
+            return
 
-        if not results_dict:
-            raise RuntimeError("All R engines failed.")
-
-        # Check cancellation before upload
-        print_log("Checking job status before upload...")
-        try:
-            r_status = http_session.get(f"{BACKEND_URL}/api/analysis/{job_id}", timeout=15)
-            if r_status.status_code == 200:
-                if r_status.json().get("state") == "CANCELLED":
-                    print_log(f"Job {job_id} was cancelled. Discarding results.")
-                    return
-        except Exception as e:
-            print_log(f"Status check failed: {e}. Proceeding with upload.")
-
-        # Upload results
-        print_log("Uploading results...")
-        payload = {
-            "worker_id": WORKER_ID,
-            "results": results_dict,
-            "warnings": warnings
-        }
-        r_submit = http_session.post(f"{BACKEND_URL}/api/workers/jobs/{job_id}/results", json=payload, headers=HEADERS, timeout=60)
-        r_submit.raise_for_status()
-        print_log(f"Job {job_id} completed successfully.")
+        print_log("Finalizing job...")
+        if not _post_finish(job_id, warnings):
+            print_log("Finalize endpoint unavailable; sending aggregate results instead.")
+            _upload_legacy(job_id, results_dict, warnings)
+        print_log(f"Job {job_id} finalized.")
 
 # ---------------------------------------------------------------------------
 # Main Polling Loop

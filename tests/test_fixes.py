@@ -21,11 +21,13 @@ class HermeticJobStoreTest(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.mkdtemp(prefix="bioinsight_test_")
         os.environ["BIOINSIGHT_DB_PATH"] = os.path.join(self.tmp, "jobs.db")
+        os.environ["BIOINSIGHT_UPLOAD_DIR"] = os.path.join(self.tmp, "uploads")
         JobStore._instance = None
 
     def tearDown(self):
         JobStore._instance = None
         os.environ.pop("BIOINSIGHT_DB_PATH", None)
+        os.environ.pop("BIOINSIGHT_UPLOAD_DIR", None)
         shutil.rmtree(self.tmp, ignore_errors=True)
 
     # --- Fix 2: configurable DB path -------------------------------------
@@ -77,6 +79,7 @@ class ApiWorkflowTest(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.mkdtemp(prefix="bioinsight_api_")
         os.environ["BIOINSIGHT_DB_PATH"] = os.path.join(self.tmp, "jobs.db")
+        os.environ["BIOINSIGHT_UPLOAD_DIR"] = os.path.join(self.tmp, "uploads")
         JobStore._instance = None
         from app.main import app
         from starlette.testclient import TestClient
@@ -93,6 +96,7 @@ class ApiWorkflowTest(unittest.TestCase):
     def tearDown(self):
         JobStore._instance = None
         os.environ.pop("BIOINSIGHT_DB_PATH", None)
+        os.environ.pop("BIOINSIGHT_UPLOAD_DIR", None)
         shutil.rmtree(self.tmp, ignore_errors=True)
 
     def _submit(self):
@@ -102,7 +106,7 @@ class ApiWorkflowTest(unittest.TestCase):
                 "counts_file": ("counts.csv", self.counts, "text/csv"),
                 "metadata_file": ("meta.csv", self.meta, "text/csv"),
             },
-            data={"params": "{}"},
+            data={"params": '{"control_group": "Control", "treated_group": "Treated", "condition_col": "condition"}'},
         )
 
     # --- Fix 6: response state matches stored state ----------------------
@@ -117,6 +121,30 @@ class ApiWorkflowTest(unittest.TestCase):
         status = self.client.get(f"/api/analysis/{job_id}").json()
         self.assertEqual(status["state"], JobState.QUEUED)
         self.assertIsNotNone(status["qc_data"])
+
+    def test_submit_requires_explicit_contrast_groups(self):
+        resp = self.client.post(
+            "/api/analysis",
+            files={
+                "counts_file": ("counts.csv", self.counts, "text/csv"),
+                "metadata_file": ("meta.csv", self.meta, "text/csv"),
+            },
+            data={"params": '{"condition_col": "condition"}'},
+        )
+        self.assertEqual(resp.status_code, 400)
+        self.assertIn("control_group", resp.text)
+
+    def test_submit_rejects_same_control_and_treated_group(self):
+        resp = self.client.post(
+            "/api/analysis",
+            files={
+                "counts_file": ("counts.csv", self.counts, "text/csv"),
+                "metadata_file": ("meta.csv", self.meta, "text/csv"),
+            },
+            data={"params": '{"control_group": "Control", "treated_group": "Control"}'},
+        )
+        self.assertEqual(resp.status_code, 400)
+        self.assertIn("must differ", resp.text)
 
     # --- Fix 5: sync routes hand file paths (not DataFrames) to runner ---
     def test_sync_route_passes_file_paths_to_runner(self):

@@ -18,6 +18,57 @@ from app.analysis.validator import validate_analysis_input, DataValidationError
 from app.analysis.runner import REngineRunner
 from app.analysis.qc import compute_qc_metrics
 
+# Engines the backend knows how to execute. DESeq2 and edgeR are the two
+# required methods for the dissertation workflow; limma-voom remains available
+# as an optional third method.
+ENGINES = ("deseq2", "edger", "limma")
+CORE_ENGINES = ("deseq2", "edger")
+
+
+def _initial_methods() -> Dict[str, Dict[str, Any]]:
+    return {
+        engine: {
+            "status": "pending",
+            "error": None,
+            "rows": 0,
+            "updated_at": None,
+        }
+        for engine in ENGINES
+    }
+
+
+def ensure_methods(job: Optional[Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
+    """Return a complete method-status map for old and new job records.
+
+    Older jobs (and results uploaded by an older worker) have no ``methods``
+    key. Derive it from the saved result tables so the API and UI remain
+    backwards compatible without rewriting historical rows.
+    """
+    if not job:
+        return _initial_methods()
+    methods = _initial_methods()
+    stored = job.get("methods") or {}
+    for engine in ENGINES:
+        if isinstance(stored.get(engine), dict):
+            methods[engine].update(stored[engine])
+    for engine in ENGINES:
+        if engine in (job.get("results") or {}) and methods[engine]["status"] == "pending":
+            methods[engine]["status"] = "completed"
+            methods[engine]["rows"] = len(job["results"].get(engine) or [])
+    return methods
+
+
+def _terminal_state(methods: Dict[str, Dict[str, Any]], results: Dict[str, Any]) -> str:
+    completed = [
+        engine for engine in CORE_ENGINES
+        if methods.get(engine, {}).get("status") == "completed" and results.get(engine)
+    ]
+    if len(completed) == len(CORE_ENGINES):
+        return JobState.COMPLETED
+    if completed:
+        return JobState.PARTIALLY_COMPLETED
+    return JobState.FAILED
+
 
 def _normalise_design_params(params: Dict[str, Any], meta_path: str) -> Dict[str, Any]:
     """Make design/contrast match the cleaned metadata column names.
@@ -61,6 +112,7 @@ class JobState:
     ENRICHMENT = "ENRICHMENT"
     GENERATING_RESULTS = "GENERATING_RESULTS"
     COMPLETED = "COMPLETED"
+    PARTIALLY_COMPLETED = "PARTIALLY_COMPLETED"
     FAILED = "FAILED"
     CANCELLED = "CANCELLED"
     WORKER_DISCONNECTED = "WORKER_DISCONNECTED"
@@ -141,6 +193,8 @@ class JobStore:
             "metadata_path": metadata_path,
             "params": params,
             "results": None,
+            "methods": _initial_methods(),
+            "comparison": None,
             "qc_data": None,
             "worker_id": None
         }
@@ -173,7 +227,14 @@ class JobStore:
                 conn.execute("UPDATE jobs SET data = ? WHERE job_id = ?", (json.dumps(job_data), job_id))
 
     def update_job_results_atomic(self, job_id: str, results: Dict[str, Any], warnings: List[str] = None, worker_id: str = None) -> bool:
-        """Atomically transitions job to COMPLETED only if state is RUNNING or GENERATING_RESULTS."""
+        """Atomically save results and derive the terminal state.
+
+        A job is COMPLETED only when both core methods produced a table. If
+        exactly one did, it is PARTIALLY_COMPLETED so the UI does not report a
+        two-method analysis as fully successful. ``results`` is retained for
+        backwards compatibility with workers/API clients that upload every
+        engine in one request.
+        """
         with self.lock:
             with self._connect(immediate=True) as conn:
                 cursor = conn.execute("SELECT data FROM jobs WHERE job_id = ?", (job_id,))
@@ -185,18 +246,197 @@ class JobStore:
                     return False
                 if worker_id is not None and job_data.get("worker_id") not in (None, worker_id):
                     return False
-                job_data["state"] = JobState.COMPLETED
-                job_data["progress"] = 100
-                job_data["message"] = "Analysis completed successfully!"
-                job_data["updated_at"] = time.time()
+
+                now = time.time()
+                methods = ensure_methods(job_data)
+                merged = job_data.get("results") or {}
+                for engine, table in (results or {}).items():
+                    if engine not in ENGINES:
+                        continue
+                    merged[engine] = table
+                    methods[engine].update({
+                        "status": "completed",
+                        "error": None,
+                        "rows": len(table or []),
+                        "updated_at": now,
+                    })
+                # The aggregate endpoint is final. Any core method that was not
+                # in this payload cannot become available later, so report it as
+                # failed instead of leaving a misleading "pending" status.
+                for engine in CORE_ENGINES:
+                    if (engine not in (results or {})
+                            and methods[engine]["status"] not in ("completed", "failed")):
+                        methods[engine].update({
+                            "status": "failed",
+                            "error": "No result table was uploaded for this method.",
+                            "updated_at": now,
+                        })
+                job_data["results"] = merged
+                job_data["methods"] = methods
                 if warnings:
                     job_data["warnings"].extend(warnings)
-                job_data["results"] = results
+
+                state = _terminal_state(methods, merged)
+                job_data["state"] = state
+                job_data["updated_at"] = now
+                if state == JobState.COMPLETED:
+                    job_data["progress"] = 100
+                    job_data["message"] = "DESeq2 and edgeR completed successfully."
+                    job_data["error"] = None
+                elif state == JobState.PARTIALLY_COMPLETED:
+                    job_data["progress"] = 100
+                    job_data["message"] = "One differential-expression method completed; the other failed."
+                    job_data["error"] = "; ".join(
+                        f"{e}: {methods[e].get('error')}" for e in CORE_ENGINES
+                        if methods[e]["status"] == "failed"
+                    ) or job_data.get("error")
+                else:
+                    job_data["progress"] = 0
+                    job_data["message"] = "No differential-expression method completed."
+                    job_data["error"] = job_data.get("error") or "; ".join(
+                        f"{e}: {methods[e].get('error')}" for e in CORE_ENGINES
+                        if methods[e].get("error")
+                    ) or "All engines failed."
+
                 cursor = conn.execute(
                     "UPDATE jobs SET data = ? WHERE job_id = ? AND json_extract(data, '$.state') IN ('RUNNING', 'GENERATING_RESULTS')",
                     (json.dumps(job_data), job_id),
                 )
                 return cursor.rowcount == 1
+
+    def update_job_method(self, job_id: str, engine: str, status: str,
+                          results: Optional[List[Dict[str, Any]]] = None,
+                          error: Optional[str] = None,
+                          worker_id: Optional[str] = None) -> Optional[Dict[str, Any]]:
+        """Persist one method's running/completed/failed state.
+
+        Called as soon as an engine finishes so the frontend can display it
+        while the other engine is still running. The job remains RUNNING until
+        ``finish_job`` (or the legacy all-at-once upload) decides the terminal
+        state.
+        """
+        if engine not in ENGINES or status not in ("running", "completed", "failed"):
+            return None
+        with self.lock:
+            with self._connect(immediate=True) as conn:
+                row = conn.execute("SELECT data FROM jobs WHERE job_id = ?", (job_id,)).fetchone()
+                if not row:
+                    return None
+                job_data = json.loads(row[0])
+                if job_data.get("state") in (
+                    JobState.COMPLETED, JobState.PARTIALLY_COMPLETED,
+                    JobState.FAILED, JobState.CANCELLED,
+                ):
+                    return None
+                if worker_id is not None and job_data.get("worker_id") not in (None, worker_id):
+                    return None
+
+                now = time.time()
+                methods = ensure_methods(job_data)
+                method = methods[engine]
+                if status == "completed" and not results:
+                    status = "failed"
+                    error = "The engine returned an empty result table."
+                method["status"] = status
+                method["updated_at"] = now
+                if status == "completed":
+                    method["error"] = None
+                    method["rows"] = len(results or [])
+                    method.setdefault("results", None)
+                    job_data.setdefault("results", {})
+                    if job_data["results"] is None:
+                        job_data["results"] = {}
+                    job_data["results"][engine] = results or []
+                elif status == "failed":
+                    method["error"] = error or "Engine failed without an error message."
+
+                job_data["methods"] = methods
+                job_data["state"] = JobState.RUNNING
+                job_data["updated_at"] = now
+                done = [e for e in CORE_ENGINES if methods[e]["status"] == "completed"]
+                job_data["message"] = (
+                    f"{engine} {status}."
+                    if status != "running"
+                    else f"Running {engine}..."
+                )
+                job_data["progress"] = 40 + int(45 * len(done) / len(CORE_ENGINES))
+                conn.execute("UPDATE jobs SET data = ? WHERE job_id = ?", (json.dumps(job_data), job_id))
+                return job_data
+
+    def finish_job(self, job_id: str, worker_id: Optional[str] = None,
+                   warnings: Optional[List[str]] = None) -> Optional[str]:
+        """Finalise a job after the worker has reported every method.
+
+        Unlike the legacy all-at-once endpoint this does not need the result
+        tables again; they are already in the job record.
+        """
+        with self.lock:
+            with self._connect(immediate=True) as conn:
+                row = conn.execute("SELECT data FROM jobs WHERE job_id = ?", (job_id,)).fetchone()
+                if not row:
+                    return None
+                job_data = json.loads(row[0])
+                if job_data.get("state") in (
+                    JobState.COMPLETED, JobState.PARTIALLY_COMPLETED,
+                    JobState.FAILED, JobState.CANCELLED,
+                ):
+                    return job_data["state"]
+                if worker_id is not None and job_data.get("worker_id") not in (None, worker_id):
+                    return None
+
+                now = time.time()
+                methods = ensure_methods(job_data)
+                # Core methods must report success or failure. limma-voom is
+                # optional: if the worker never started it, leave it pending so
+                # the UI says "not run" instead of inventing a failure.
+                for engine in CORE_ENGINES:
+                    if methods[engine]["status"] in ("pending", "running"):
+                        methods[engine]["status"] = "failed"
+                        methods[engine]["error"] = "No result was reported by the worker."
+                        methods[engine]["updated_at"] = now
+                if methods["limma"]["status"] == "running":
+                    methods["limma"]["status"] = "failed"
+                    methods["limma"]["error"] = "No result was reported by the worker."
+                    methods["limma"]["updated_at"] = now
+                results = job_data.get("results") or {}
+                state = _terminal_state(methods, results)
+
+                job_data["methods"] = methods
+                job_data["state"] = state
+                job_data["updated_at"] = now
+                if warnings:
+                    job_data["warnings"].extend(warnings)
+                if state == JobState.COMPLETED:
+                    job_data["progress"] = 100
+                    job_data["message"] = "DESeq2 and edgeR completed successfully."
+                elif state == JobState.PARTIALLY_COMPLETED:
+                    job_data["progress"] = 100
+                    job_data["message"] = "One differential-expression method completed; the other failed."
+                    job_data["error"] = "; ".join(
+                        f"{e}: {methods[e].get('error')}" for e in CORE_ENGINES
+                        if methods[e]["status"] == "failed"
+                    )
+                else:
+                    job_data["progress"] = 0
+                    job_data["message"] = "No differential-expression method completed."
+                    job_data["error"] = "; ".join(
+                        f"{e}: {methods[e].get('error')}" for e in CORE_ENGINES
+                    ) or "All engines failed."
+                conn.execute("UPDATE jobs SET data = ? WHERE job_id = ?", (json.dumps(job_data), job_id))
+                return state
+
+    def save_comparison(self, job_id: str, comparison: Dict[str, Any]) -> bool:
+        """Persist a user-triggered DESeq2-vs-edgeR comparison on the job."""
+        with self.lock:
+            with self._connect(immediate=True) as conn:
+                row = conn.execute("SELECT data FROM jobs WHERE job_id = ?", (job_id,)).fetchone()
+                if not row:
+                    return False
+                job_data = json.loads(row[0])
+                job_data["comparison"] = comparison
+                job_data["updated_at"] = time.time()
+                conn.execute("UPDATE jobs SET data = ? WHERE job_id = ?", (json.dumps(job_data), job_id))
+                return True
 
     def update_job_qc(self, job_id: str, qc_data: dict):
         with self.lock:
@@ -333,31 +573,28 @@ class LocalRuntime(ComputeRuntime):
             ("limma", os.path.join(app_dir, "limma", "limma_script.R")),
         ]
         params = _normalise_design_params(job.get("params", {}) or {}, meta_path)
-        results = {}
         warnings = []
         for i, (name, script) in enumerate(engines):
             progress = 40 + int(40 * i / len(engines))
+            store.update_job_method(job_id, name, "running", worker_id="local")
             store.update_job(job_id, JobState.RUNNING, progress, f"Running {name} locally...")
             try:
                 df = REngineRunner.run_r_script(script, counts_path, meta_path, params)
+                df = df.replace([float("inf"), float("-inf")], float("nan"))
                 df = df.where(pd.notnull(df), None)
-                results[name] = df.to_dict(orient="records")
+                table = df.to_dict(orient="records")
+                store.update_job_method(job_id, name, "completed", results=table, worker_id="local")
             except Exception as e:  # one engine failing must not sink the others
-                warnings.append(f"{name}: {e}")
-        if not results:
-            store.update_job(
-                job_id, JobState.FAILED, 0,
-                "All R engines failed on the local runtime.",
-                error="; ".join(warnings) or "no engine produced results",
-            )
-            return
+                message = f"{name}: {e}"
+                warnings.append(message)
+                store.update_job_method(job_id, name, "failed", error=str(e), worker_id="local")
+
         store.update_job(job_id, JobState.RUNNING, 95, "Saving results...")
-        ok = store.update_job_results_atomic(job_id, results, warnings=warnings, worker_id="local")
-        if not ok:
-            store.update_job(
-                job_id, JobState.COMPLETED, 100, "Analysis completed (local).",
-                warnings=warnings, results=results,
-            )
+        state = store.finish_job(job_id, worker_id="local", warnings=warnings)
+        if state is None:
+            # The job disappeared or belongs to another worker. Never fabricate a
+            # completed state in that case.
+            return
 
 class CloudRuntime(ComputeRuntime):
     """(Future) Runs the job on AWS/GCP Batch."""

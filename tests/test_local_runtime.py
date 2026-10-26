@@ -58,7 +58,7 @@ class TestLocalRuntime(unittest.TestCase):
         ):
             LocalRuntime().dispatch(self.store, self.job_id)
         job = self.store.get_job(self.job_id)
-        self.assertEqual(job["state"], JobState.COMPLETED)
+        self.assertEqual(job["state"], JobState.PARTIALLY_COMPLETED)
         self.assertNotIn("deseq2", job["results"])
         self.assertIn("edger", job["results"])
         self.assertTrue(any("deseq2" in w.lower() for w in job["warnings"]))

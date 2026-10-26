@@ -45,6 +45,19 @@ class TestBioInsightBackend(unittest.TestCase):
             validate_analysis_input(self.counts_df, self.meta_df, {"condition_col": "condition"})
         self.assertIn("contains negative values", str(context.exception))
 
+    def test_missing_counts_validation(self):
+        self.counts_df.iloc[0, 0] = np.nan
+        with self.assertRaises(DataValidationError) as context:
+            validate_analysis_input(self.counts_df, self.meta_df, {"condition_col": "condition"})
+        self.assertIn("missing values", str(context.exception))
+
+    def test_infinite_counts_validation(self):
+        self.counts_df = self.counts_df.astype(float)
+        self.counts_df.iloc[0, 0] = np.inf
+        with self.assertRaises(DataValidationError) as context:
+            validate_analysis_input(self.counts_df, self.meta_df, {"condition_col": "condition"})
+        self.assertIn("non-finite", str(context.exception))
+
     def test_insufficient_replicates_validation(self):
         self.meta_df.iloc[3, 0] = "OtherGroup"
         with self.assertRaises(DataValidationError) as context:

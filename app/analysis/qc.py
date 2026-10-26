@@ -65,6 +65,28 @@ def compute_qc_metrics(counts_df: pd.DataFrame, meta_df: pd.DataFrame) -> dict:
             "varianceExplained": [0, 0]
         }
         
+    # Heatmap of the most variable genes (log2 CPM, row z-score). This is a
+    # shared QC view derived from the input matrix, not a per-method result.
+    expression_heatmap = None
+    if not filtered_counts.empty and len(sample_names) > 1:
+        log_cpm = np.log2(cpm[keep_mask] + 1)
+        variances = log_cpm.var(axis=1).to_numpy()
+        top_n = min(50, len(variances))
+        top_idx = np.argsort(variances)[-top_n:][::-1]
+        top = log_cpm.iloc[top_idx].to_numpy(dtype=float)
+        row_means = top.mean(axis=1, keepdims=True)
+        row_stds = top.std(axis=1, keepdims=True)
+        row_stds[row_stds == 0] = 1.0
+        z = np.clip((top - row_means) / row_stds, -3, 3)
+        expression_heatmap = {
+            "genes": filtered_counts.index[top_idx].astype(str).tolist(),
+            "samples": sample_names,
+            "groups": [str(g) for g in sample_groups],
+            "values": z.tolist(),
+            "metric": "log2 CPM, row z-score",
+            "selection": f"Top {top_n} most variable genes among {genes_retained} filtered genes",
+        }
+
     # Outlier detection (simple heuristic)
     outlier_status = []
     outlier_count = 0
@@ -132,5 +154,6 @@ def compute_qc_metrics(counts_df: pd.DataFrame, meta_df: pd.DataFrame) -> dict:
         "avgDetRate": avg_det_rate,
         "outlierCount": outlier_count,
         "genesRetained": genes_retained,
-        "totalGenes": total_genes
+        "totalGenes": total_genes,
+        "expressionHeatmap": expression_heatmap,
     }

@@ -1,129 +1,120 @@
+import os
+import sys
 import unittest
 from unittest.mock import patch, MagicMock
-import sys
-import os
 
-# Add backend to path
+import pandas as pd
+
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from workers.colab_worker import process_job, main, HeartbeatThread
+from workers.colab_worker import process_job
+
 
 class TestColabWorker(unittest.TestCase):
-    @patch("workers.colab_worker.http_session")
-    @patch("workers.colab_worker.run_r_script")
-    def test_process_job_success(self, mock_run_r, mock_session):
-        # Mock GET dataset counts/meta
-        mock_counts_resp = MagicMock()
-        mock_counts_resp.content = b"counts"
-        mock_meta_resp = MagicMock()
-        mock_meta_resp.content = b"meta"
-        
-        # Mock job status
-        mock_status_resp = MagicMock()
-        mock_status_resp.status_code = 200
-        mock_status_resp.json.return_value = {"state": "RUNNING"}
-        
-        # Mock UPLOAD result
-        mock_upload_resp = MagicMock()
-        
-        def mock_get(url, **kwargs):
-            if "dataset/counts" in url:
-                return mock_counts_resp
-            elif "dataset/metadata" in url:
-                return mock_meta_resp
-            elif "/api/analysis/" in url:
-                return mock_status_resp
-            raise ValueError(f"Unexpected GET {url}")
-            
-        mock_session.get.side_effect = mock_get
-        mock_session.post.return_value = mock_upload_resp
-        
-        # Mock R scripts
-        mock_df = MagicMock()
-        mock_df.where.return_value.to_dict.return_value = [{"gene": "A"}]
-        mock_run_r.return_value = mock_df
-        
-        process_job("job123", {"design": "~ condition"})
-        
-        self.assertEqual(mock_run_r.call_count, 3) # DESeq2, edgeR, limma
-        mock_session.post.assert_called_once()
-        args, kwargs = mock_session.post.call_args
-        self.assertIn("job123/results", args[0])
-        self.assertIn("deseq2", kwargs["json"]["results"])
-        
-    @patch("workers.colab_worker.http_session")
-    @patch("workers.colab_worker.run_r_script")
-    def test_process_job_cancelled(self, mock_run_r, mock_session):
-        # Mock GET dataset counts/meta
-        mock_counts_resp = MagicMock()
-        mock_counts_resp.content = b"counts"
-        mock_meta_resp = MagicMock()
-        mock_meta_resp.content = b"meta"
-        
-        # Mock job status (CANCELLED)
-        mock_status_resp = MagicMock()
-        mock_status_resp.status_code = 200
-        mock_status_resp.json.return_value = {"state": "CANCELLED"}
-        
-        def mock_get(url, **kwargs):
-            if "dataset/counts" in url:
-                return mock_counts_resp
-            elif "dataset/metadata" in url:
-                return mock_meta_resp
-            elif "/api/analysis/" in url:
-                return mock_status_resp
-            raise ValueError(f"Unexpected GET {url}")
-            
-        mock_session.get.side_effect = mock_get
-        
-        # Mock R scripts
-        mock_df = MagicMock()
-        mock_df.where.return_value.to_dict.return_value = [{"gene": "A"}]
-        mock_run_r.return_value = mock_df
-        
-        process_job("job123", {"design": "~ condition"})
-        
-        self.assertEqual(mock_run_r.call_count, 3) # DESeq2, edgeR, limma
-        mock_session.post.assert_not_called() # Should NOT upload results if cancelled
+    def _session(self, state="RUNNING"):
+        counts_resp = MagicMock(content=b"counts")
+        meta_resp = MagicMock(content=b"meta")
+        status_resp = MagicMock(status_code=200)
+        status_resp.json.return_value = {"state": state}
 
-    @patch("workers.colab_worker.http_session")
-    @patch("workers.colab_worker.run_r_script")
-    def test_process_job_partial_failure(self, mock_run_r, mock_session):
-        # Test that if one R engine fails, warning is recorded and remaining engines are uploaded
-        mock_counts_resp = MagicMock()
-        mock_counts_resp.content = b"counts"
-        mock_meta_resp = MagicMock()
-        mock_meta_resp.content = b"meta"
-        mock_status_resp = MagicMock()
-        mock_status_resp.status_code = 200
-        mock_status_resp.json.return_value = {"state": "RUNNING"}
-        
-        def mock_get(url, **kwargs):
+        def get(url, **kwargs):
             if "dataset/counts" in url:
-                return mock_counts_resp
-            elif "dataset/metadata" in url:
-                return mock_meta_resp
-            elif "/api/analysis/" in url:
-                return mock_status_resp
+                return counts_resp
+            if "dataset/metadata" in url:
+                return meta_resp
+            if "/api/analysis/" in url:
+                return status_resp
             raise ValueError(f"Unexpected GET {url}")
-            
-        mock_session.get.side_effect = mock_get
-        
-        # DESeq2 fails, edgeR succeeds, limma succeeds
-        mock_df = MagicMock()
-        mock_df.where.return_value.to_dict.return_value = [{"gene": "A"}]
-        mock_run_r.side_effect = [RuntimeError("DESeq2 dispersion error"), mock_df, mock_df]
-        
-        process_job("job456", {"design": "~ condition"})
-        
+
+        session = MagicMock()
+        session.get.side_effect = get
+        session.post.return_value = MagicMock(status_code=200)
+        return session
+
+    def _posts(self, session):
+        return [call.args[0] for call in session.post.call_args_list]
+
+    @patch("workers.colab_worker.run_r_script")
+    @patch("workers.colab_worker.http_session")
+    def test_process_job_uploads_each_method_then_finishes(self, mock_session, mock_run_r):
+        session = self._session()
+        mock_session.get = session.get
+        mock_session.post = session.post
+        mock_run_r.return_value = pd.DataFrame([
+            {"Gene": "A", "log2FoldChange": 1.2, "pvalue": 0.01, "padj": 0.02}
+        ])
+
+        process_job("job123", {"design": "~ condition"})
+
         self.assertEqual(mock_run_r.call_count, 3)
-        mock_session.post.assert_called_once()
-        args, kwargs = mock_session.post.call_args
-        self.assertIn("job456/results", args[0])
-        self.assertNotIn("deseq2", kwargs["json"]["results"])
-        self.assertIn("edger", kwargs["json"]["results"])
-        self.assertIn("limma", kwargs["json"]["results"])
-        self.assertTrue(any("DESeq2" in w for w in kwargs["json"]["warnings"]))
+        urls = self._posts(mock_session)
+        for engine in ("deseq2", "edger", "limma"):
+            self.assertTrue(any(f"/method/{engine}" in u for u in urls), urls)
+        self.assertTrue(any(u.endswith("/finish") for u in urls), urls)
+        self.assertFalse(any(u.endswith("/results") for u in urls), urls)
+
+        completed = [
+            c.kwargs["json"] for c in mock_session.post.call_args_list
+            if c.args[0].endswith("/method/deseq2") and c.kwargs["json"]["status"] == "completed"
+        ]
+        self.assertEqual(completed[0]["results"][0]["Gene"], "A")
+
+    @patch("workers.colab_worker.run_r_script")
+    @patch("workers.colab_worker.http_session")
+    def test_process_job_falls_back_to_aggregate_when_incremental_upload_fails(
+        self, mock_session, mock_run_r
+    ):
+        session = self._session()
+        mock_session.get = session.get
+
+        def post(url, **kwargs):
+            if url.endswith("/method/deseq2") and kwargs.get("json", {}).get("status") == "completed":
+                return MagicMock(status_code=404)
+            return MagicMock(status_code=200)
+
+        mock_session.post.side_effect = post
+        mock_run_r.return_value = pd.DataFrame([
+            {"Gene": "A", "log2FoldChange": 1.2, "pvalue": 0.01, "padj": 0.02}
+        ])
+
+        process_job("job789", {"design": "~ condition"})
+
+        urls = self._posts(mock_session)
+        self.assertTrue(any(u.endswith("/results") for u in urls), urls)
+        self.assertFalse(any(u.endswith("/finish") for u in urls), urls)
+
+    @patch("workers.colab_worker.run_r_script")
+    @patch("workers.colab_worker.http_session")
+    def test_process_job_stops_when_cancelled(self, mock_session, mock_run_r):
+        session = self._session(state="CANCELLED")
+        mock_session.get = session.get
+        mock_session.post = session.post
+
+        process_job("job123", {"design": "~ condition"})
+
+        self.assertEqual(mock_run_r.call_count, 0)
+        mock_session.post.assert_not_called()
+
+    @patch("workers.colab_worker.run_r_script")
+    @patch("workers.colab_worker.http_session")
+    def test_process_job_reports_partial_failure(self, mock_session, mock_run_r):
+        session = self._session()
+        mock_session.get = session.get
+        mock_session.post = session.post
+        good = pd.DataFrame([{"Gene": "A", "log2FoldChange": 1.0, "pvalue": 0.01, "padj": 0.02}])
+        mock_run_r.side_effect = [RuntimeError("DESeq2 dispersion error"), good, good]
+
+        process_job("job456", {"design": "~ condition"})
+
+        calls = mock_session.post.call_args_list
+        failed = [
+            c.kwargs["json"] for c in calls
+            if c.args[0].endswith("/method/deseq2") and c.kwargs["json"]["status"] == "failed"
+        ]
+        self.assertTrue(failed)
+        self.assertIn("dispersion", failed[0]["error"])
+        self.assertTrue(any(c.args[0].endswith("/finish") for c in calls))
+
 
 if __name__ == "__main__":
     unittest.main()

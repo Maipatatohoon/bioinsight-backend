@@ -15,6 +15,8 @@ parser$add_argument("--meta", type="character", required=TRUE, help="Path to met
 parser$add_argument("--out", type="character", required=TRUE, help="Path to save output results CSV")
 parser$add_argument("--design", type="character", default="~ condition", help="Design formula (e.g., ~ condition)")
 parser$add_argument("--contrast", type="character", default="", help="Contrast string (e.g., condition_Treated_vs_Control)")
+parser$add_argument("--numerator", type="character", default="", help="Treatment level for the contrast (preferred over --contrast)")
+parser$add_argument("--denominator", type="character", default="", help="Control level for the contrast (preferred over --contrast)")
 
 args <- parser$parse_args()
 
@@ -51,7 +53,20 @@ dds <- dds[keep, ]
 dds <- DESeq(dds, quiet=TRUE)
 
 # 6. Extract Results
-if (nchar(args$contrast) > 0) {
+if (nchar(args$numerator) > 0 && nchar(args$denominator) > 0) {
+  factor_name <- "condition"
+  if (!(factor_name %in% colnames(coldata))) {
+    stop("The --numerator/--denominator contrast needs a metadata column named 'condition'.")
+  }
+  levels_seen <- levels(coldata[[factor_name]])
+  if (!(args$numerator %in% levels_seen) || !(args$denominator %in% levels_seen)) {
+    stop(sprintf(
+      "Contrast levels not found. Numerator '%s', denominator '%s', available: %s",
+      args$numerator, args$denominator, paste(levels_seen, collapse=", ")
+    ))
+  }
+  res <- results(dds, contrast=c(factor_name, args$numerator, args$denominator))
+} else if (nchar(args$contrast) > 0) {
   # Parse contrast string format: factor_num_vs_den
   parts <- unlist(strsplit(args$contrast, "_vs_"))
   if (length(parts) == 2) {

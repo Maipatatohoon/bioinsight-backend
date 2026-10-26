@@ -41,6 +41,8 @@ class REngineRunner:
                 "--out", out_path,
                 "--design", params.get("design", "~ condition"),
                 "--contrast", params.get("contrast", ""),
+                "--numerator", str(params.get("treated_group", "")),
+                "--denominator", str(params.get("control_group", "")),
             ]
 
             try:
