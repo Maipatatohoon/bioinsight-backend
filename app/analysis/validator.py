@@ -58,6 +58,24 @@ def validate_analysis_input(counts_df: pd.DataFrame, meta_df: pd.DataFrame, para
     counts_df.columns = counts_df.columns.astype(str).str.strip()
     meta_df.index = meta_df.index.astype(str).str.strip()
 
+    # Annotation columns such as featureCounts' "Length" are not samples and
+    # must not be counted as missing metadata. Metadata sample IDs remain the
+    # authority for which columns are real samples.
+    annotation_candidates = {
+        'length', 'gene_length', 'start', 'end', 'chromosome', 'chr', 'strand',
+        'gc', 'gc_content', 'gene_biotype', 'biotype',
+    }
+    annotation_cols = [
+        c for c in counts_df.columns
+        if str(c).strip().lower() in annotation_candidates and str(c) not in meta_ids
+    ]
+    if annotation_cols:
+        counts_df = counts_df.drop(columns=annotation_cols)
+        warnings.append(
+            "Ignored annotation column(s) that are not samples: "
+            + ", ".join(map(str, annotation_cols))
+        )
+
     # 2. Check Duplicate Gene IDs / Sample IDs
     if counts_df.index.duplicated().any():
         dup_count = counts_df.index.duplicated().sum()
@@ -87,10 +105,11 @@ def validate_analysis_input(counts_df: pd.DataFrame, meta_df: pd.DataFrame, para
             + ", ".join(map(str, meta_only[:8]))
             + (" ..." if len(meta_only) > 8 else "")
         )
-    if len(common_samples) < 4:
+    if len(common_samples) < 2:
         raise DataValidationError(
-            f"Fewer than 4 matching samples between count matrix and metadata (found {len(common_samples)}: {list(common_samples)}). "
-            "RNA-seq differential expression requires matching sample names across files."
+            f"Fewer than 2 matching samples between count matrix and metadata (found {len(common_samples)}: {list(common_samples)}). "
+            "Sample IDs must match exactly, including upper/lower case and trailing spaces; "
+            "fix the metadata sample column so it matches the count-matrix headers."
         )
 
     counts_df = counts_df[common_samples]
@@ -168,14 +187,7 @@ def validate_analysis_input(counts_df: pd.DataFrame, meta_df: pd.DataFrame, para
         meta_df = meta_df.rename(columns={condition_col: "condition"})
         condition_col = "condition"
 
-    counts_per_group = meta_df[condition_col].astype(str).value_counts()
-    for group_name, count in counts_per_group.items():
-        if count < 2:
-            raise DataValidationError(
-                f"Experimental group '{group_name}' has only {count} sample(s). "
-                "Differential expression tools (DESeq2, edgeR) require at least 2 biological replicates per group to estimate dispersion."
-            )
-
+    group_values = meta_df[condition_col].astype(str)
     control_group = params.get("control_group")
     treated_group = params.get("treated_group")
     if control_group is not None and treated_group is not None:
@@ -183,13 +195,48 @@ def validate_analysis_input(counts_df: pd.DataFrame, meta_df: pd.DataFrame, para
         treated_group = str(treated_group)
         if control_group == treated_group:
             raise DataValidationError("Control and treatment groups must be different.")
+
+        available_groups = list(pd.unique(group_values))
         for label, level in (("control", control_group), ("treatment", treated_group)):
-            count = int((meta_df[condition_col].astype(str) == level).sum())
+            count = int((group_values == level).sum())
             if count < 2:
-                available = ", ".join(map(str, counts_per_group.index))
+                available = ", ".join(map(str, available_groups))
                 raise DataValidationError(
                     f"The {label} group '{level}' has {count} sample(s); at least 2 are required. "
                     f"Available groups: {available}."
+                )
+
+        # A two-group contrast must not estimate dispersion from groups the user
+        # did not select. The frontend already sends only the two chosen groups;
+        # this also protects direct API clients that send a full metadata table.
+        selected_mask = group_values.isin([control_group, treated_group])
+        dropped_samples = meta_df.index[~selected_mask].tolist()
+        if dropped_samples:
+            dropped_groups = sorted(set(group_values[~selected_mask]))
+            warnings.append(
+                f"Excluded {len(dropped_samples)} sample(s) from group(s) outside the selected "
+                f"contrast ({', '.join(map(str, dropped_groups))}): "
+                + ", ".join(map(str, dropped_samples[:8]))
+                + (" ..." if len(dropped_samples) > 8 else "")
+            )
+            meta_df = meta_df.loc[selected_mask]
+            counts_numeric = counts_numeric[meta_df.index]
+
+        counts_per_group = meta_df[condition_col].astype(str).value_counts()
+        for group_name, count in counts_per_group.items():
+            if count < 2:
+                raise DataValidationError(
+                    f"Experimental group '{group_name}' has only {count} sample(s) "
+                    "after restricting to the selected contrast. At least 2 biological "
+                    "replicates per group are required."
+                )
+    else:
+        counts_per_group = group_values.value_counts()
+        for group_name, count in counts_per_group.items():
+            if count < 2:
+                raise DataValidationError(
+                    f"Experimental group '{group_name}' has only {count} sample(s). "
+                    "Differential expression tools (DESeq2, edgeR) require at least 2 biological replicates per group to estimate dispersion."
                 )
 
     return counts_numeric.astype(int), meta_df, warnings
