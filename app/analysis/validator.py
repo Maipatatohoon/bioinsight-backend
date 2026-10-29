@@ -27,10 +27,23 @@ def validate_analysis_input(counts_df: pd.DataFrame, meta_df: pd.DataFrame, para
     if meta_df.empty:
         raise DataValidationError("Metadata matrix is empty.")
 
-    # Normalize gene identifier column if counts_df came with gene column instead of index
-    if counts_df.columns[0].lower() in ['gene', 'gene_id', 'gene_name', 'symbol', 'id', 'ensembl_id'] or counts_df.index.dtype == 'int64':
-        first_col = counts_df.columns[0]
-        # Check if first column contains non-numeric identifiers while other columns are numeric/counts
+    # Normalize gene identifier column if counts_df came with gene column instead of index.
+    # Numeric Entrez IDs are common (e.g. GSE60450), so the column must be
+    # identified by its header and by not being a metadata sample ID - not by
+    # whether pandas inferred its dtype as numeric.
+    if meta_df.columns[0].lower() in ['sample', 'sample_id', 'id', 'run', 'gsm', 'srr']:
+        meta_ids = set(meta_df.iloc[:, 0].astype(str).str.strip())
+    else:
+        meta_ids = set(meta_df.index.astype(str).str.strip())
+
+    first_col = counts_df.columns[0]
+    gene_like = str(first_col).strip().lower() in [
+        'gene', 'gene_id', 'geneid', 'gene_name', 'symbol', 'id', 'ensembl_id', 'entrez', 'entrezgeneid'
+    ]
+    if gene_like and str(first_col).strip() not in meta_ids:
+        counts_df = counts_df.set_index(first_col)
+    elif counts_df.index.dtype == 'int64':
+        # Index-less CSV whose first column is a numeric gene ID.
         if not pd.api.types.is_numeric_dtype(counts_df[first_col]):
             counts_df = counts_df.set_index(first_col)
 
