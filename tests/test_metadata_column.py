@@ -42,7 +42,16 @@ class MetadataColumnTest(unittest.TestCase):
         _, meta, warnings = validate_analysis_input(_counts(), _meta("group"), {})
         self.assertIn("condition", meta.columns)
         self.assertEqual(list(meta["condition"]), ["Control", "Control", "Treated", "Treated"])
-        self.assertTrue(any("Using 'group'" in w for w in warnings))
+        # Auto-selecting the only grouping column is the normal path and must
+        # not raise a user-facing warning.
+        self.assertFalse(any("Condition column" in w for w in warnings))
+
+    def test_explicit_missing_condition_column_warns(self):
+        _, meta, warnings = validate_analysis_input(
+            _counts(), _meta("group"), {"condition_col": "disease"}
+        )
+        self.assertIn("condition", meta.columns)
+        self.assertTrue(any("Condition column 'disease'" in w for w in warnings))
 
     def test_treatment_column_is_renamed_to_condition(self):
         _, meta, _ = validate_analysis_input(_counts(), _meta("treatment"), {})

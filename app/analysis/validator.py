@@ -150,13 +150,20 @@ def validate_analysis_input(counts_df: pd.DataFrame, meta_df: pd.DataFrame, para
     counts_numeric = counts_numeric.round().astype(int)
 
     # 7. Biological Replicates Check
-    condition_col = params.get("condition_col", "condition")
+    requested_col = params.get("condition_col")
+    condition_col = requested_col or "condition"
     if condition_col not in meta_df.columns:
         # Try to find first non-sample-id column
         possible_cols = [c for c in meta_df.columns if c.lower() not in ['sample', 'sample_id', 'id']]
         if possible_cols:
             condition_col = possible_cols[0]
-            warnings.append(f"Condition column '{params.get('condition_col')}' not found. Using '{condition_col}' as design factor.")
+            # Only warn when the caller explicitly asked for a column that is
+            # absent. Auto-selecting Group is the normal path and should not
+            # look like a problem in the interface.
+            if requested_col:
+                warnings.append(
+                    f"Condition column '{requested_col}' not found. Using '{condition_col}' as design factor."
+                )
         else:
             raise DataValidationError(f"Condition column '{condition_col}' not found in metadata columns: {list(meta_df.columns)}.")
 
